@@ -11,6 +11,24 @@
 #include <asm/cpufeature.h>
 #include <asm/sysreg.h>
 
+enum { WFI, NOP } idle = WFI;
+
+/* User can over-ride above with "idle=<wfi|nop>" in cmdline */
+static int __init setup_idle(char *s)
+{
+	if (!s)
+		return -1;
+        else if (!strcmp(s, "wfi"))
+                idle = WFI;
+        else if (!strcmp(s, "nop"))
+                idle = NOP;
+	else
+		return -1;
+
+	return 0;
+}
+early_param("idle", setup_idle);
+
 /*
  *	cpu_do_idle()
  *
@@ -26,8 +44,10 @@ void __cpuidle cpu_do_idle(void)
 
 	arm_cpuidle_save_irq_context(&context);
 
-	dsb(sy);
-	wfi();
+	if (likely(idle == WFI)) {
+		dsb(sy);
+		wfi();
+	}
 
 	arm_cpuidle_restore_irq_context(&context);
 }

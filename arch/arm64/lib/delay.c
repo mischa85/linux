@@ -18,6 +18,8 @@
 #define USECS_TO_CYCLES(time_usecs)			\
 	xloops_to_cycles((time_usecs) * 0x10C7UL)
 
+extern enum { WFI, NOP } idle;
+
 static inline unsigned long xloops_to_cycles(unsigned long xloops)
 {
 	return (xloops * loops_per_jiffy * HZ) >> 32;
@@ -49,7 +51,8 @@ void __delay(unsigned long cycles)
 		 * Start with WFIT. If an interrupt makes us resume
 		 * early, use a WFET loop to complete the delay.
 		 */
-		wfit(end);
+		if (likely(idle == WFI))
+			wfit(end);
 		while ((__delay_cycles() - start) < cycles)
 			wfet(end);
 	} else 	if (arch_timer_evtstrm_available()) {
