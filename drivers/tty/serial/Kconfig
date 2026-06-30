@@ -97,6 +97,19 @@ config SERIAL_EARLYCON_RISCV_SBI
 	  with "earlycon=sbi" on the kernel command line. The console is
 	  enabled when early_param is processed.
 
+config SERIAL_APPLE_DOCKCHANNEL
+	bool "Apple DockChannel UART earlycon"
+	depends on ARCH_APPLE || COMPILE_TEST
+	select SERIAL_CORE
+	select SERIAL_EARLYCON
+	default ARCH_APPLE
+	help
+	  Earlycon (boot console) for the Apple DockChannel UART, the debug
+	  console on Apple Silicon SoCs, reachable over the USB-C SBU debug
+	  UART. Enable on the kernel command line via the DT stdout-path
+	  (compatible "apple,dockchannel-uart") or
+	  "earlycon=dockchannel,mmio32,<addr>".
+
 config SERIAL_SB1250_DUART
 	tristate "BCM1xxx on-chip DUART serial support"
 	depends on SIBYTE_SB1xxx_SOC=y
