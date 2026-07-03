@@ -1282,27 +1282,29 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
 	} else {
 		/*
-		 * ANS3/CoastGuard: AQA/ASQ/ACQ are unbacked and SError from EL1.
-		 * Build the geometry macOS hands to the CoastGuard firmware. We
-		 * cannot issue pmap_iommu_ioctl() from Linux; the working theory
-		 * is that the controller reads the queue locations from the
-		 * NVMMU TCB base registers programmed below instead. Log the
-		 * config so the experiment can confirm the values are sane.
+		 * ANS3/CoastGuard: AQA/ASQ/ACQ SError on a plain EL1/EL2 store at
+		 * the primary BAR (secure-BAR gate), but land via the +0x40000000
+		 * BAR alias. m1n1's HV hooks the NVMe BAR first page and redirects
+		 * these writes (BAR off 0x24-0x37) to the alias at 0x44dcc0000, so
+		 * from here we just issue the standard admin-queue writes as 32-bit
+		 * halves (matching what the ANS firmware echoed back as its Admin
+		 * SQ/CQ base). This is what clears the "fast decode err 0x4".
 		 */
-		struct apple_ans3_adminq_cfg cfg = {
-			.valid       = cpu_to_le32(1),
-			.sq_depth_m1 = cpu_to_le32(APPLE_NVME_AQ_DEPTH - 1),
-			.cq_depth_m1 = cpu_to_le32(APPLE_NVME_AQ_DEPTH - 1),
-			.sq_iova     = cpu_to_le64(anv->adminq.sq_dma_addr),
-			.cq_iova     = cpu_to_le64(anv->adminq.cq_dma_addr),
-		};
+		writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
+		writel(lower_32_bits(anv->adminq.sq_dma_addr),
+		       anv->mmio_nvme + NVME_REG_ASQ);
+		writel(upper_32_bits(anv->adminq.sq_dma_addr),
+		       anv->mmio_nvme + NVME_REG_ASQ + 4);
+		writel(lower_32_bits(anv->adminq.cq_dma_addr),
+		       anv->mmio_nvme + NVME_REG_ACQ);
+		writel(upper_32_bits(anv->adminq.cq_dma_addr),
+		       anv->mmio_nvme + NVME_REG_ACQ + 4);
 
 		dev_info(anv->dev,
-			 "ANS3: skipping AQA/ASQ/ACQ; CoastGuard adminq cfg "
-			 "sq=%pad cq=%pad depth=%u (relying on NVMMU TCB path)\n",
+			 "ANS3: wrote AQA/ASQ/ACQ via m1n1 alias redirect "
+			 "sq=%pad cq=%pad depth=%u\n",
 			 &anv->adminq.sq_dma_addr, &anv->adminq.cq_dma_addr,
 			 APPLE_NVME_AQ_DEPTH);
-		(void)cfg; /* prototype: destination (PPL ioctl / relocated reg) TBD */
 	}
 
 	if (anv->hw->has_lsq_nvmmu) {
