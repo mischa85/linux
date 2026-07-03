@@ -597,6 +597,118 @@
 				status = "disabled";
 			};
 		};
+
+		/* ================================================================
+		 * USB (bring-up, USB2/HS host only) — usb-drd0..2, T6041 / M4 Max.
+		 *
+		 * Strategy: NO atc-phy driver exists for atc-phy,t6040 and NO
+		 * sn201202x (SPMI PD) driver exists, so the full dwc3-apple +
+		 * apple,t8103-atcphy + role-switch stack cannot work here yet.
+		 * Instead we rely on the state m1n1 leaves behind (usb_phy_bringup
+		 * runs on all ports on M3/M4: ATC powered, USB2 PHY running,
+		 * pipehandler muxed to the dummy USB3 pipe, dwc3 out of reset) and
+		 * bind the PLAIN dwc3 core ("snps,dwc3", no glue) in dr_mode="host".
+		 * The USB2 PHY is flipped from device to host mode pre-boot via the
+		 * m1n1 proxy (USB2PHY_SIG.HOST = bits 14:12 at usb2phy+0x08, with a
+		 * power-down/up cycle around it, mirroring atc.c) — see
+		 * t6041-usb/usb_host_prep.py. USB3/SS needs the real ATC PHY port
+		 * and PD driver work; HS is enough for a root hub + devices.
+		 *
+		 * usb-drd0 (USB-C port 1, left-rear) is the m1n1 proxy/console port
+		 * under the HV — the guest must NOT touch it, so it stays disabled.
+		 *
+		 * CPU-phys = ADT /arm-io/usb-drdN|dart-usbN reg + 0x200000000.
+		 * dwc3 core window = ADT reg[0], size 0xcd00 like t8103.dtsi (the
+		 * 0xcd00..0xcdff Apple CIO regs are left alone; those tunables only
+		 * matter for USB3). dwc3 IRQ = first ADT interrupt (t8103 pattern).
+		 * Each dart-usbN ADT node is TWO t8110 DART instances (+0x0 and
+		 * +0x80000); dwc3 DMA is mapped through both, SID 0 on the first,
+		 * SID 1 on the second, mirroring t8103.dtsi.
+		 * power-domains omitted everywhere: m1n1 already enabled
+		 * ATC/DART/DRD domains (usb_phy_bringup) and keeps them on; the
+		 * minimal t6041-pmgr.dtsi has no ps_atc* nodes yet.
+		 * ================================================================ */
+
+		/* usb-drd0: PROXY/CONSOLE PORT (USB-C port 1) — hands off. */
+		usb_drd0: usb@382280000 {
+			compatible = "snps,dwc3";
+			reg = <0x3 0x82280000 0x0 0xcd00>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1619 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			iommus = <&usb0_dart0 0>, <&usb0_dart1 1>;
+			status = "disabled";
+		};
+
+		usb0_dart0: iommu@382f00000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x3 0x82f00000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1623 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		usb0_dart1: iommu@382f80000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x3 0x82f80000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1623 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/* usb-drd1: USB-C port 2 (left-front). */
+		usb_drd1: usb@38a280000 {
+			compatible = "snps,dwc3";
+			reg = <0x3 0x8a280000 0x0 0xcd00>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1651 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			iommus = <&usb1_dart0 0>, <&usb1_dart1 1>;
+		};
+
+		usb1_dart0: iommu@38af00000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x3 0x8af00000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1655 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		usb1_dart1: iommu@38af80000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x3 0x8af80000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1655 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* usb-drd2: USB-C port 3 (right). */
+		usb_drd2: usb@392280000 {
+			compatible = "snps,dwc3";
+			reg = <0x3 0x92280000 0x0 0xcd00>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1683 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			iommus = <&usb2_dart0 0>, <&usb2_dart1 1>;
+		};
+
+		usb2_dart0: iommu@392f00000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x3 0x92f00000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1687 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		usb2_dart1: iommu@392f80000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x3 0x92f80000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1687 IRQ_TYPE_LEVEL_HIGH>;
+		};
 	};
 };
 
