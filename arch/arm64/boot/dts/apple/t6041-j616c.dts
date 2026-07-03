@@ -26,6 +26,7 @@
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
@@ -708,6 +709,57 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1687 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* ================================================================
+		 * SPMI buses (nub-spmi-a0/a1, "spmi,gen3") carrying the ACE3
+		 * (sn201202x) USB-PD port controllers. These speak the classic
+		 * TPS6598x/CD321x register set tunneled through a small SPMI
+		 * window (select via SPMI reg 0x00, data at 0x20..0x5F) — see
+		 * asahilinux.org/docs/hw/peripherals/ace3/.
+		 * CPU-phys = ADT reg[0] + 0x200000000; slave IDs = first u32 of
+		 * each hpm node's ADT reg.
+		 * hpm0 (left-back, slave 0xc on a0) is NOT listed: that port
+		 * carries the m1n1 HV proxy/console and Linux must not manage
+		 * its PD state. hpm5 (MagSafe, slave 0x8 on a0) is not a data
+		 * port. No interrupts wired yet (the SPMI controller is also
+		 * the hpm interrupt controller, not yet supported) — the tipd
+		 * driver falls back to polling.
+		 * ================================================================ */
+		nub_spmi0: spmi@509188000 {
+			compatible = "apple,t6041-spmi", "apple,spmi";
+			reg = <0x5 0x09188000 0x0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			hpm1: usb-pd@a {
+				compatible = "apple,sn201202x";
+				reg = <0xa SPMI_USID>;
+
+				typec1: connector {
+					compatible = "usb-c-connector";
+					power-role = "dual";
+					data-role = "dual";
+				};
+			};
+		};
+
+		nub_spmi1: spmi@509198000 {
+			compatible = "apple,t6041-spmi", "apple,spmi";
+			reg = <0x5 0x09198000 0x0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			hpm2: usb-pd@c {
+				compatible = "apple,sn201202x";
+				reg = <0xc SPMI_USID>;
+
+				typec2: connector {
+					compatible = "usb-c-connector";
+					power-role = "dual";
+					data-role = "dual";
+				};
+			};
 		};
 	};
 };
