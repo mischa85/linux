@@ -898,6 +898,7 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	if (!tps6598x_read_status(tps, &status))
 		goto err_unlock;
 
+
 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE) {
 		if (!tps6598x_read_power_status(tps))
 			goto err_unlock;
@@ -2090,30 +2091,60 @@ static struct i2c_driver tps6598x_i2c_driver = {
  */
 #define ACE3_REG_SEL		0x00
 #define ACE3_SEL_BUSY		BIT(7)
+#define ACE3_REG_SIZE		0x1f
 #define ACE3_REG_DATA		0x20
 #define ACE3_SEL_TIMEOUT_US	100000
 #define ACE3_EXT_MAX		16
 
 static int ace3_select(struct spmi_device *sdev, u8 lreg)
 {
-	ktime_t timeout = ktime_add_us(ktime_get(), ACE3_SEL_TIMEOUT_US);
 	u8 val;
-	int ret;
+	int ret, attempt;
+	bool busy_timeout;
 
-	ret = spmi_register_write(sdev, ACE3_REG_SEL, ACE3_SEL_BUSY | lreg);
-	if (ret)
-		return ret;
+	/*
+	 * The real completion signal is an interrupt through the SPMI
+	 * controller; all we can do here is poll the busy bit, which is
+	 * racy around the command pickup, and the first command to a chip
+	 * that has gone quiet can be silently swallowed entirely
+	 * (hardware-verified). A successful selection latches the logical
+	 * register's (always non-zero) size into SPMI reg 0x1F — use that
+	 * to verify and retry.
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		ktime_t timeout = ktime_add_us(ktime_get(), ACE3_SEL_TIMEOUT_US);
 
-	for (;;) {
-		ret = spmi_register_read(sdev, ACE3_REG_SEL, &val);
+		ret = spmi_register_write(sdev, ACE3_REG_SEL, ACE3_SEL_BUSY | lreg);
 		if (ret)
 			return ret;
-		if (!(val & ACE3_SEL_BUSY))
+
+		usleep_range(1000, 1500);
+
+		busy_timeout = false;
+		for (;;) {
+			ret = spmi_register_read(sdev, ACE3_REG_SEL, &val);
+			if (ret)
+				return ret;
+			if (!(val & ACE3_SEL_BUSY))
+				break;
+			if (ktime_after(ktime_get(), timeout)) {
+				busy_timeout = true;
+				break;
+			}
+			usleep_range(50, 100);
+		}
+		if (busy_timeout)
+			continue;
+
+		ret = spmi_register_read(sdev, ACE3_REG_SIZE, &val);
+		if (ret)
+			return ret;
+		if (val)
 			return 0;
-		if (ktime_after(ktime_get(), timeout))
-			return -ETIMEDOUT;
-		usleep_range(50, 100);
 	}
+
+	dev_warn(&sdev->dev, "select 0x%02x failed after %d attempts\n", lreg, attempt);
+	return -EIO;
 }
 
 static int ace3_regmap_read(void *context, const void *reg_buf,
@@ -2192,6 +2223,7 @@ static int ace3_spmi_probe(struct spmi_device *sdev)
 {
 	const struct tipd_data *data;
 	struct tps6598x *tps;
+	int ret;
 
 	data = device_get_match_data(&sdev->dev);
 	if (!data)
@@ -2205,6 +2237,11 @@ static int ace3_spmi_probe(struct spmi_device *sdev)
 				       &tps6598x_regmap_config);
 	if (IS_ERR(tps->regmap))
 		return PTR_ERR(tps->regmap);
+
+	/* The chip may have gone to sleep; it drops commands until woken. */
+	ret = spmi_command_wakeup(sdev);
+	if (ret)
+		dev_warn(&sdev->dev, "wakeup command failed: %d\n", ret);
 
 	/* No interrupt wired up yet (the SPMI controller is also the hpm
 	 * interrupt controller, which is not supported) -> polling mode. */
