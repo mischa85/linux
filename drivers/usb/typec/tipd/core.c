@@ -13,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/spmi.h>
 #include <linux/interrupt.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
@@ -168,6 +169,7 @@ struct tps6598x {
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
 	u8 i2c_protocol:1;
+	int irq;
 
 	struct gpio_desc *reset;
 	struct typec_port *port;
@@ -1738,50 +1740,24 @@ static void cd321x_remove(struct tps6598x *tps)
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
 
-static int tps6598x_probe(struct i2c_client *client)
+static int tps6598x_common_probe(struct tps6598x *tps)
 {
-	const struct tipd_data *data;
-	struct tps6598x *tps;
 	struct fwnode_handle *fwnode;
 	u32 status;
 	u32 vid;
 	int ret;
 
-	data = i2c_get_match_data(client);
-	if (!data)
-		return -EINVAL;
-
-	tps = devm_kzalloc(&client->dev, data->tps_struct_size, GFP_KERNEL);
-	if (!tps)
-		return -ENOMEM;
-
-	mutex_init(&tps->lock);
-	tps->dev = &client->dev;
-	tps->data = data;
-
-	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(tps->reset))
-		return dev_err_probe(tps->dev, PTR_ERR(tps->reset),
-				     "failed to get reset GPIO\n");
-	if (tps->reset)
-		msleep(TPS_SETUP_MS);
-
-	tps->regmap = devm_regmap_init_i2c(client, &tps6598x_regmap_config);
-	if (IS_ERR(tps->regmap))
-		return PTR_ERR(tps->regmap);
-
-	if (!device_is_compatible(tps->dev, "ti,tps25750")) {
+	/*
+	 * The ACE3 (apple,sn201202x) does not implement the VID register
+	 * (reads as zero) and its MODE register does not carry one of the
+	 * known mode strings either.
+	 */
+	if (!device_is_compatible(tps->dev, "ti,tps25750") &&
+	    !device_is_compatible(tps->dev, "apple,sn201202x")) {
 		ret = tps6598x_read32(tps, TPS_REG_VID, &vid);
 		if (ret < 0 || !vid)
 			return -ENODEV;
 	}
-
-	/*
-	 * Checking can the adapter handle SMBus protocol. If it can not, the
-	 * driver needs to take care of block reads separately.
-	 */
-	if (i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
-		tps->i2c_protocol = true;
 
 	if (tps->data->switch_power_state) {
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
@@ -1791,8 +1767,12 @@ static int tps6598x_probe(struct i2c_client *client)
 
 	/* Make sure the controller has application firmware running */
 	ret = tps6598x_check_mode(tps);
-	if (ret < 0)
-		return ret;
+	if (ret < 0) {
+		if (!device_is_compatible(tps->dev, "apple,sn201202x"))
+			return ret;
+		dev_warn(tps->dev, "unrecognized mode, assuming APP\n");
+		ret = TPS_MODE_APP;
+	}
 
 	if (ret == TPS_MODE_PTCH) {
 		ret = tps->data->init(tps);
@@ -1816,7 +1796,7 @@ static int tps6598x_probe(struct i2c_client *client)
 	 * with existing DT files, we work around this by deleting any
 	 * fwnode_links to/from this fwnode.
 	 */
-	fwnode = device_get_named_child_node(&client->dev, "connector");
+	fwnode = device_get_named_child_node(tps->dev, "connector");
 	if (fwnode)
 		fw_devlink_purge_absent_suppliers(fwnode);
 
@@ -1842,14 +1822,14 @@ static int tps6598x_probe(struct i2c_client *client)
 			goto err_unregister_port;
 		ret = tps->data->connect(tps, status);
 		if (ret)
-			dev_err(&client->dev, "failed to register partner\n");
+			dev_err(tps->dev, "failed to register partner\n");
 	}
 
-	if (client->irq) {
-		ret = devm_request_threaded_irq(&client->dev, client->irq, NULL,
+	if (tps->irq) {
+		ret = devm_request_threaded_irq(tps->dev, tps->irq, NULL,
 						tps->data->irq_handler,
 						IRQF_SHARED | IRQF_ONESHOT,
-						dev_name(&client->dev), tps);
+						dev_name(tps->dev), tps);
 	} else {
 		dev_warn(tps->dev, "Unable to find the interrupt, switching to polling\n");
 		INIT_DELAYED_WORK(&tps->wq_poll, tps6598x_poll_work);
@@ -1860,13 +1840,13 @@ static int tps6598x_probe(struct i2c_client *client)
 	if (ret)
 		goto err_disconnect;
 
-	i2c_set_clientdata(client, tps);
+	dev_set_drvdata(tps->dev, tps);
 	fwnode_handle_put(fwnode);
 
 	tps->wakeup = device_property_read_bool(tps->dev, "wakeup-source");
-	if (tps->wakeup && client->irq) {
-		devm_device_init_wakeup(&client->dev);
-		enable_irq_wake(client->irq);
+	if (tps->wakeup && tps->irq) {
+		devm_device_init_wakeup(tps->dev);
+		enable_irq_wake(tps->irq);
 	}
 
 	return 0;
@@ -1886,6 +1866,58 @@ err_reset_controller:
 	tps->data->reset(tps);
 
 	return ret;
+}
+
+static struct tps6598x *tps6598x_alloc(struct device *dev,
+				       const struct tipd_data *data)
+{
+	struct tps6598x *tps;
+
+	tps = devm_kzalloc(dev, data->tps_struct_size, GFP_KERNEL);
+	if (!tps)
+		return NULL;
+
+	mutex_init(&tps->lock);
+	tps->dev = dev;
+	tps->data = data;
+
+	return tps;
+}
+
+static int tps6598x_probe(struct i2c_client *client)
+{
+	const struct tipd_data *data;
+	struct tps6598x *tps;
+
+	data = i2c_get_match_data(client);
+	if (!data)
+		return -EINVAL;
+
+	tps = tps6598x_alloc(&client->dev, data);
+	if (!tps)
+		return -ENOMEM;
+
+	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(tps->reset))
+		return dev_err_probe(tps->dev, PTR_ERR(tps->reset),
+				     "failed to get reset GPIO\n");
+	if (tps->reset)
+		msleep(TPS_SETUP_MS);
+
+	tps->regmap = devm_regmap_init_i2c(client, &tps6598x_regmap_config);
+	if (IS_ERR(tps->regmap))
+		return PTR_ERR(tps->regmap);
+
+	/*
+	 * Checking can the adapter handle SMBus protocol. If it can not, the
+	 * driver needs to take care of block reads separately.
+	 */
+	if (i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
+		tps->i2c_protocol = true;
+
+	tps->irq = client->irq;
+
+	return tps6598x_common_probe(tps);
 }
 
 static void tps6598x_remove(struct i2c_client *client)
@@ -1913,17 +1945,16 @@ static void tps6598x_remove(struct i2c_client *client)
 
 static int __maybe_unused tps6598x_suspend(struct device *dev)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct tps6598x *tps = i2c_get_clientdata(client);
+	struct tps6598x *tps = dev_get_drvdata(dev);
 
 	if (tps->wakeup) {
-		disable_irq(client->irq);
-		enable_irq_wake(client->irq);
+		disable_irq(tps->irq);
+		enable_irq_wake(tps->irq);
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 1);
 	}
 
-	if (!client->irq)
+	if (!tps->irq)
 		cancel_delayed_work_sync(&tps->wq_poll);
 
 	return 0;
@@ -1931,8 +1962,7 @@ static int __maybe_unused tps6598x_suspend(struct device *dev)
 
 static int __maybe_unused tps6598x_resume(struct device *dev)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct tps6598x *tps = i2c_get_clientdata(client);
+	struct tps6598x *tps = dev_get_drvdata(dev);
 	int ret;
 
 	ret = tps6598x_check_mode(tps);
@@ -1946,14 +1976,14 @@ static int __maybe_unused tps6598x_resume(struct device *dev)
 	}
 
 	if (tps->wakeup) {
-		disable_irq_wake(client->irq);
-		enable_irq(client->irq);
+		disable_irq_wake(tps->irq);
+		enable_irq(tps->irq);
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 0);
 		msleep(TPS_SETUP_MS);
 	}
 
-	if (!client->irq)
+	if (!tps->irq)
 		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
 				   msecs_to_jiffies(POLL_INTERVAL));
 
@@ -2043,7 +2073,206 @@ static struct i2c_driver tps6598x_i2c_driver = {
 	.remove = tps6598x_remove,
 	.id_table = tps6598x_id,
 };
-module_i2c_driver(tps6598x_i2c_driver);
+
+#if IS_ENABLED(CONFIG_SPMI)
+/*
+ * Apple ACE3 (sn201202x, M3 Pro/Max and M4 generation Macs): the same
+ * logical register set, but attached over SPMI instead of I2C. A thin
+ * transport tunnels the logical registers through the SPMI register space
+ * (https://asahilinux.org/docs/hw/peripherals/ace3/):
+ *
+ *  - SPMI reg 0x00: write 0x80 | logical_reg (with a BASIC register-write
+ *    command; extended writes are ACKed but do not trigger the selection)
+ *    to select a logical register. Bit 7 clears when the selection
+ *    completed and the data window is valid.
+ *  - SPMI regs 0x20..0x5F: the selected logical register's data,
+ *    zero-padded. Reads return it; writes commit to the selected register.
+ */
+#define ACE3_REG_SEL		0x00
+#define ACE3_SEL_BUSY		BIT(7)
+#define ACE3_REG_DATA		0x20
+#define ACE3_SEL_TIMEOUT_US	100000
+#define ACE3_EXT_MAX		16
+
+static int ace3_select(struct spmi_device *sdev, u8 lreg)
+{
+	ktime_t timeout = ktime_add_us(ktime_get(), ACE3_SEL_TIMEOUT_US);
+	u8 val;
+	int ret;
+
+	ret = spmi_register_write(sdev, ACE3_REG_SEL, ACE3_SEL_BUSY | lreg);
+	if (ret)
+		return ret;
+
+	for (;;) {
+		ret = spmi_register_read(sdev, ACE3_REG_SEL, &val);
+		if (ret)
+			return ret;
+		if (!(val & ACE3_SEL_BUSY))
+			return 0;
+		if (ktime_after(ktime_get(), timeout))
+			return -ETIMEDOUT;
+		usleep_range(50, 100);
+	}
+}
+
+static int ace3_regmap_read(void *context, const void *reg_buf,
+			    size_t reg_size, void *val_buf, size_t val_size)
+{
+	struct spmi_device *sdev = context;
+	const u8 *reg = reg_buf;
+	size_t off = 0;
+	int ret;
+
+	if (reg_size != 1 || !val_size || val_size > 64)
+		return -EINVAL;
+
+	ret = ace3_select(sdev, *reg);
+	if (ret)
+		return ret;
+
+	while (off < val_size) {
+		size_t chunk = min_t(size_t, val_size - off, ACE3_EXT_MAX);
+
+		ret = spmi_ext_register_read(sdev, ACE3_REG_DATA + off,
+					     val_buf + off, chunk);
+		if (ret)
+			return ret;
+		off += chunk;
+	}
+
+	return 0;
+}
+
+static int ace3_regmap_write(void *context, const void *data, size_t count)
+{
+	struct spmi_device *sdev = context;
+	const u8 *buf = data;
+	int ret;
+
+	/* Only logical registers of size <= 16 can be written atomically. */
+	if (count < 2 || count - 1 > ACE3_EXT_MAX)
+		return -EINVAL;
+
+	ret = ace3_select(sdev, buf[0]);
+	if (ret)
+		return ret;
+
+	return spmi_ext_register_write(sdev, ACE3_REG_DATA, buf + 1, count - 1);
+}
+
+static const struct regmap_bus ace3_regmap_bus = {
+	.read = ace3_regmap_read,
+	.write = ace3_regmap_write,
+	.max_raw_read = 64,
+	.max_raw_write = ACE3_EXT_MAX,
+};
+
+/* Same handling as the I2C-attached cd321x otherwise */
+static const struct tipd_data ace3_data = {
+	.irq_handler = cd321x_interrupt,
+	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
+		     APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
+		     APPLE_CD_REG_INT_PLUG_EVENT,
+	.tps_struct_size = sizeof(struct cd321x),
+	.remove = cd321x_remove,
+	.register_port = cd321x_register_port,
+	.unregister_port = cd321x_unregister_port,
+	.trace_data_status = trace_cd321x_data_status,
+	.trace_power_status = trace_tps6598x_power_status,
+	.trace_status = trace_tps6598x_status,
+	.init = cd321x_init,
+	.read_data_status = cd321x_read_data_status,
+	.reset = cd321x_reset,
+	.switch_power_state = cd321x_switch_power_state,
+	.connect = cd321x_connect,
+};
+
+static int ace3_spmi_probe(struct spmi_device *sdev)
+{
+	const struct tipd_data *data;
+	struct tps6598x *tps;
+
+	data = device_get_match_data(&sdev->dev);
+	if (!data)
+		return -EINVAL;
+
+	tps = tps6598x_alloc(&sdev->dev, data);
+	if (!tps)
+		return -ENOMEM;
+
+	tps->regmap = devm_regmap_init(&sdev->dev, &ace3_regmap_bus, sdev,
+				       &tps6598x_regmap_config);
+	if (IS_ERR(tps->regmap))
+		return PTR_ERR(tps->regmap);
+
+	/* No interrupt wired up yet (the SPMI controller is also the hpm
+	 * interrupt controller, which is not supported) -> polling mode. */
+	tps->irq = 0;
+
+	return tps6598x_common_probe(tps);
+}
+
+static void ace3_spmi_remove(struct spmi_device *sdev)
+{
+	struct tps6598x *tps = dev_get_drvdata(&sdev->dev);
+
+	if (!tps)
+		return;
+
+	cancel_delayed_work_sync(&tps->wq_poll);
+
+	if (tps->data->remove)
+		tps->data->remove(tps);
+
+	tps6598x_disconnect(tps, 0);
+	tps->data->unregister_port(tps);
+	usb_role_switch_put(tps->role_sw);
+	tps->data->reset(tps);
+}
+
+static const struct of_device_id ace3_spmi_of_match[] = {
+	{ .compatible = "apple,sn201202x", &ace3_data },
+	{}
+};
+MODULE_DEVICE_TABLE(of, ace3_spmi_of_match);
+
+static struct spmi_driver ace3_spmi_driver = {
+	.driver = {
+		.name = "sn201202x",
+		.of_match_table = ace3_spmi_of_match,
+	},
+	.probe = ace3_spmi_probe,
+	.remove = ace3_spmi_remove,
+};
+#endif /* IS_ENABLED(CONFIG_SPMI) */
+
+static int __init tps6598x_module_init(void)
+{
+	int ret;
+
+	ret = i2c_add_driver(&tps6598x_i2c_driver);
+	if (ret)
+		return ret;
+
+#if IS_ENABLED(CONFIG_SPMI)
+	ret = spmi_driver_register(&ace3_spmi_driver);
+	if (ret)
+		i2c_del_driver(&tps6598x_i2c_driver);
+#endif
+
+	return ret;
+}
+module_init(tps6598x_module_init);
+
+static void __exit tps6598x_module_exit(void)
+{
+#if IS_ENABLED(CONFIG_SPMI)
+	spmi_driver_unregister(&ace3_spmi_driver);
+#endif
+	i2c_del_driver(&tps6598x_i2c_driver);
+}
+module_exit(tps6598x_module_exit);
 
 MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
 MODULE_LICENSE("GPL v2");
