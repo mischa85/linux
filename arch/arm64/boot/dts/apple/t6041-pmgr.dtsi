@@ -8,6 +8,30 @@
  */
 
 &pmgr1 {
+	/* NVMe / ANS storage path (added for the apple-nvme bring-up). */
+	ps_apcie_gp: power-controller@100 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x100 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_gp";
+	};
+	ps_apcie_st0: power-controller@108 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x108 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_st0";
+		power-domains = <&ps_apcie_gp>;
+	};
+	ps_ans: power-controller@370 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x370 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ans";
+		power-domains = <&ps_fab3_soc>;
+	};
 	ps_fab3_soc: power-controller@118 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x118 4>;

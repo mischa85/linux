@@ -53,6 +53,42 @@
 #define APPLE_ANS_LINEAR_SQ_CTRL 0x24908
 #define APPLE_ANS_LINEAR_SQ_EN	 BIT(0)
 
+/*
+ * macOS 15+/26 firmware ("ANS3") relocated the unknown/linear-SQ control
+ * registers into the NVMMU register block (0x281xx). See sven's gist and
+ * #asahi-dev (2026-06). The doorbells (0x2490c/0x24910) stayed put.
+ */
+#define APPLE_ANS3_UNKNOWN_CTRL	   0x28130
+#define APPLE_ANS3_LINEAR_SQ_CTRL  0x2813c
+
+/*
+ * ANS3 / CoastGuard admin-queue configuration.
+ *
+ * macOS (AppleANS2CGv2Controller::SetupAdminQueue, inherited by
+ * AppleANS3CGv2Controller) does NOT program the standard AQA/ASQ/ACQ MMIO
+ * registers on this silicon -- they are unbacked and SError if written from
+ * EL1. Instead it hands the admin-queue geometry to the CoastGuard firmware:
+ *
+ *	pmap_iommu_ioctl(cg, APPLE_ANS3_CG_RESET_ADMINQ, NULL, 0);
+ *	pmap_iommu_ioctl(cg, APPLE_ANS3_CG_SET_ADMINQ, &cfg, sizeof(cfg));
+ *
+ * pmap_iommu_ioctl() is an XNU/SPTM (PPL) interface that we cannot call from
+ * Linux. The open question is whether the controller picks up the admin queue
+ * from the EL1-accessible NVMMU TCB base registers (0x28108/0x28110) instead,
+ * in which case skipping AQA/ASQ/ACQ is sufficient. This struct documents the
+ * exact geometry macOS communicates, for whichever path turns out to be needed.
+ */
+struct apple_ans3_adminq_cfg {
+	__le32 valid;		/* always 1 */
+	__le32 reserved;
+	__le32 sq_depth_m1;	/* admin submission queue depth - 1 (< 0x1000) */
+	__le32 cq_depth_m1;	/* admin completion queue depth - 1 */
+	__le64 sq_iova;		/* admin SQ base address (DMA/IOVA) */
+	__le64 cq_iova;		/* admin CQ base address (DMA/IOVA) */
+};
+#define APPLE_ANS3_CG_RESET_ADMINQ 0x8022
+#define APPLE_ANS3_CG_SET_ADMINQ   0x8027
+
 #define APPLE_ANS_LINEAR_ASQ_DB	 0x2490c
 #define APPLE_ANS_LINEAR_IOSQ_DB 0x24910
 
@@ -171,6 +207,18 @@ struct apple_nvme_iod {
 struct apple_nvme_hw {
 	bool has_lsq_nvmmu;
 	u32 max_queue_depth;
+	/* Offsets vary by firmware ABI (pre-15 vs ANS3); only used when
+	 * has_lsq_nvmmu is set. */
+	u32 linear_sq_ctrl;
+	u32 unknown_ctrl;
+	/*
+	 * ANS3 / CoastGuard firmware (macOS 15+/26). RE of macOS's
+	 * AppleANS3CGv2Controller shows it does NOT write MAX_PEND_CMDS_CTRL
+	 * (GetMaxPendingCommands just returns a constant 0x100) and treats the
+	 * PRP-null-check disable as a no-op. The old offsets are unbacked on
+	 * this silicon, so writing them SErrors (L2C access fault).
+	 */
+	bool is_ans3;
 };
 
 struct apple_nvme {
@@ -353,6 +401,45 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 	 * NVMMU invalidation (and making the tag available again)
 	 * and the final CQ update.
 	 */
+	spin_lock_irq(&anv->lock);
+	writel(tag, q->sq_db);
+	spin_unlock_irq(&anv->lock);
+}
+
+/*
+ * ANS3 / CoastGuard (macOS 15+/26, e.g. T6041) command submission.
+ *
+ * The NVMMU TCB layout was redesigned. RE of macOS
+ * AppleANS2CGv2Controller::NVMeCoastGuardSetTCBEntry (inherited by
+ * AppleANS3CGv2Controller) shows the firmware reads:
+ *   +0x00  u32  raw NVMe CDW0 (opcode | flags | command_id)
+ *   +0x38  u32  command CDW14
+ *   +0x3c  u32  command CDW15
+ *   +0x40  inline shadow-PRP list (only for multi-segment transfers)
+ * with all other bytes reserved-must-be-zero. The DMA direction is derived
+ * by the firmware from the opcode (macOS isOpCodeDir()), and the data-buffer
+ * PRP1 travels in the submission-queue entry (CDW6-7) as usual. Unlike the
+ * older TCB we therefore must NOT write opcode/dma_flags/command_id/length or
+ * prp1/prp2 into the TCB: on ANS3 those land in the reserved region and the
+ * co-processor rejects the command ("cmd parsing error ... fast decode err
+ * 0x4" / BAD_CMD).
+ */
+static void apple_nvme_submit_cmd_ans3(struct apple_nvme_queue *q,
+				  struct nvme_command *cmd)
+{
+	struct apple_nvme *anv = queue_to_apple_nvme(q);
+	u32 tag = nvme_tag_from_cid(cmd->common.command_id);
+	struct apple_nvmmu_tcb *tcb = &q->tcbs[tag];
+	const __le32 *cdw = (const __le32 *)cmd;
+	__le32 *tcb_dw = (__le32 *)tcb;
+
+	memset(tcb, 0, sizeof(*tcb));
+	tcb_dw[0x00 / 4] = cdw[0];	/* CDW0: opcode | flags | command_id */
+	tcb_dw[0x38 / 4] = cdw[14];	/* CDW14 */
+	tcb_dw[0x3c / 4] = cdw[15];	/* CDW15 */
+
+	memcpy(&q->sqes[tag], cmd, sizeof(*cmd));
+
 	spin_lock_irq(&anv->lock);
 	writel(tag, q->sq_db);
 	spin_unlock_irq(&anv->lock);
@@ -835,7 +922,9 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
                 return BLK_STS_OK;
         }
 
-	if (anv->hw->has_lsq_nvmmu)
+	if (anv->hw->is_ans3)
+		apple_nvme_submit_cmd_ans3(q, cmnd);
+	else if (anv->hw->has_lsq_nvmmu)
 		apple_nvme_submit_cmd_t8103(q, cmnd);
 	else
 		apple_nvme_submit_cmd_t8015(q, cmnd);
@@ -1152,12 +1241,15 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		 * since T6000.
 		 */
 		writel(APPLE_ANS_LINEAR_SQ_EN,
-			anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+			anv->mmio_nvme + anv->hw->linear_sq_ctrl);
 
-		/* Allow as many pending command as possible for both queues */
-		writel(anv->hw->max_queue_depth
-			| (anv->hw->max_queue_depth << 16), anv->mmio_nvme
-			+ APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		if (!anv->hw->is_ans3) {
+			/* Allow as many pending command as possible for both
+			 * queues. ANS3 omits this (macOS does not write it). */
+			writel(anv->hw->max_queue_depth
+				| (anv->hw->max_queue_depth << 16),
+				anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		}
 
 		/* Setup the NVMMU for the maximum admin and IO queue depth */
 		writel(anv->hw->max_queue_depth - 1,
@@ -1168,11 +1260,13 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		 * where any PRP is set to zero (including those that don't use
 		 * that field) fail and the co-processor complains about
 		 * "completed with err BAD_CMD-" or a "NULL_PRP_PTR_ERR" in the
-		 * syslog
+		 * syslog. ANS3 still needs this (observed BAD_CMD on the first
+		 * admin command without it) -- just at the relocated offset
+		 * (hw->unknown_ctrl == APPLE_ANS3_UNKNOWN_CTRL on ANS3).
 		 */
-		writel(readl(anv->mmio_nvme + APPLE_ANS_UNKNOWN_CTRL) &
+		writel(readl(anv->mmio_nvme + anv->hw->unknown_ctrl) &
 			~APPLE_ANS_PRP_NULL_CHECK,
-			anv->mmio_nvme + APPLE_ANS_UNKNOWN_CTRL);
+			anv->mmio_nvme + anv->hw->unknown_ctrl);
 	}
 
 	/* Setup the admin queue */
@@ -1181,9 +1275,35 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	else
 		aqa = anv->hw->max_queue_depth - 1;
 	aqa |= aqa << 16;
-	writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
-	writeq(anv->adminq.sq_dma_addr, anv->mmio_nvme + NVME_REG_ASQ);
-	writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
+
+	if (!anv->hw->is_ans3) {
+		writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
+		writeq(anv->adminq.sq_dma_addr, anv->mmio_nvme + NVME_REG_ASQ);
+		writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
+	} else {
+		/*
+		 * ANS3/CoastGuard: AQA/ASQ/ACQ are unbacked and SError from EL1.
+		 * Build the geometry macOS hands to the CoastGuard firmware. We
+		 * cannot issue pmap_iommu_ioctl() from Linux; the working theory
+		 * is that the controller reads the queue locations from the
+		 * NVMMU TCB base registers programmed below instead. Log the
+		 * config so the experiment can confirm the values are sane.
+		 */
+		struct apple_ans3_adminq_cfg cfg = {
+			.valid       = cpu_to_le32(1),
+			.sq_depth_m1 = cpu_to_le32(APPLE_NVME_AQ_DEPTH - 1),
+			.cq_depth_m1 = cpu_to_le32(APPLE_NVME_AQ_DEPTH - 1),
+			.sq_iova     = cpu_to_le64(anv->adminq.sq_dma_addr),
+			.cq_iova     = cpu_to_le64(anv->adminq.cq_dma_addr),
+		};
+
+		dev_info(anv->dev,
+			 "ANS3: skipping AQA/ASQ/ACQ; CoastGuard adminq cfg "
+			 "sq=%pad cq=%pad depth=%u (relying on NVMMU TCB path)\n",
+			 &anv->adminq.sq_dma_addr, &anv->adminq.cq_dma_addr,
+			 APPLE_NVME_AQ_DEPTH);
+		(void)cfg; /* prototype: destination (PPL ioctl / relocated reg) TBD */
+	}
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
@@ -1765,11 +1885,28 @@ static const struct apple_nvme_hw apple_nvme_t8015_hw = {
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.has_lsq_nvmmu = true,
 	.max_queue_depth = 64,
+	.linear_sq_ctrl = APPLE_ANS_LINEAR_SQ_CTRL,
+	.unknown_ctrl = APPLE_ANS_UNKNOWN_CTRL,
+};
+
+/*
+ * ANS3 firmware (macOS 15+/26). Same as t8103 but with the relocated
+ * control registers. NOTE: M4/A18-Pro-class silicon is reported to SError
+ * even with these offsets (additional un-RE'd change at MAX_PEND_CMDS_CTRL /
+ * ASQ); this variant unblocks at least up to that point. See #asahi-dev.
+ */
+static const struct apple_nvme_hw apple_nvme_ans3_hw = {
+	.has_lsq_nvmmu = true,
+	.max_queue_depth = 64,
+	.linear_sq_ctrl = APPLE_ANS3_LINEAR_SQ_CTRL,
+	.unknown_ctrl = APPLE_ANS3_UNKNOWN_CTRL,
+	.is_ans3 = true,
 };
 
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
+	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_ans3_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };
