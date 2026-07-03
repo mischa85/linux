@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Minimal PMGR power-state chain for the T6041 UART (ps_uart0 and its
+ * ancestors), extracted from the full ADT-generated pmgr by following
+ * power-domains links. Enough to power the s5l UART for earlycon.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+&pmgr1 {
+	ps_fab3_soc: power-controller@118 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x118 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab3_soc";
+		apple,always-on;
+		power-domains = <&ps_afc>;
+	};
+	ps_sio: power-controller@120 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		apple,always-on;
+		power-domains = <&ps_fab3_soc>;
+	};
+	ps_uart_p: power-controller@1a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_p";
+		power-domains = <&ps_sio>;
+	};
+	ps_uart0: power-controller@1f8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1f8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart0";
+		power-domains = <&ps_uart_p>;
+	};
+};
+
+&pmgr2 {
+	ps_afc: power-controller@178 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x178 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afc";
+		apple,always-on;
+	};
+};
+

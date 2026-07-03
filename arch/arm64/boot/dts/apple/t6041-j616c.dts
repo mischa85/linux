@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (16-inch, M4 Max, 2024), J616c / T6041
+ *
+ * SKELETON device tree for bringing up Linux as an m1n1-HV guest far enough to
+ * reach earlycon and start trapping. NOT a complete Asahi DT: peripherals
+ * (DARTs, NVMe, DCP, PCIe, SMC, pmgr, pinctrl, ...) are intentionally omitted.
+ *
+ * Values are from on-hardware probing (see t6041_proxy_dump/):
+ *   - chip-id 0x6041, board apple,j616c
+ *   - CPU topology (experiments/midr.py): 4x E (cluster0) + 12x P (clusters 1,2)
+ *   - AIC v3 at 0x302400000, offsets/iack confirmed against the ADT and the
+ *     in-tree t8122 (M3) aic3 binding
+ *   - UART base 0x429200000 (m1n1 EARLY_UART_BASE), IRQ 1559 (ADT uart0)
+ *
+ * TODO / unverified:
+ *   - "apple,brava-{e,p}" core compatibles are placeholders (no M4 cputype yet)
+ *   - /memory is a placeholder; the loader (m1n1) fixes it up
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M4 Max, 2024) [skeleton]";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	aliases {
+		serial0 = &serial0;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* filled in by m1n1 */
+			status = "disabled"; /* enabled by m1n1 */
+		};
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0x0 0x0 0x80000000>; /* placeholder; fixed up by loader */
+	};
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu-map {
+			cluster0 {
+				core0 { cpu = <&cpu_e0>; };
+				core1 { cpu = <&cpu_e1>; };
+				core2 { cpu = <&cpu_e2>; };
+				core3 { cpu = <&cpu_e3>; };
+			};
+			cluster1 {
+				core0 { cpu = <&cpu_p00>; };
+				core1 { cpu = <&cpu_p01>; };
+				core2 { cpu = <&cpu_p02>; };
+				core3 { cpu = <&cpu_p03>; };
+				core4 { cpu = <&cpu_p04>; };
+				core5 { cpu = <&cpu_p05>; };
+			};
+			cluster2 {
+				core0 { cpu = <&cpu_p10>; };
+				core1 { cpu = <&cpu_p11>; };
+				core2 { cpu = <&cpu_p12>; };
+				core3 { cpu = <&cpu_p13>; };
+				core4 { cpu = <&cpu_p14>; };
+				core5 { cpu = <&cpu_p15>; };
+			};
+		};
+
+		/* E-cluster (cluster 0): MPIDR 0x800000xx */
+		cpu_e0:  cpu@0     { compatible = "apple,brava-e"; device_type = "cpu"; reg = <0x0 0x0>;     enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_e1:  cpu@1     { compatible = "apple,brava-e"; device_type = "cpu"; reg = <0x0 0x1>;     enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_e2:  cpu@2     { compatible = "apple,brava-e"; device_type = "cpu"; reg = <0x0 0x2>;     enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_e3:  cpu@3     { compatible = "apple,brava-e"; device_type = "cpu"; reg = <0x0 0x3>;     enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+
+		/* P-cluster 1: MPIDR 0x800101xx */
+		cpu_p00: cpu@10100 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10100>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p01: cpu@10101 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10101>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p02: cpu@10102 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10102>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p03: cpu@10103 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10103>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p04: cpu@10104 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10104>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p05: cpu@10105 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10105>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+
+		/* P-cluster 2: MPIDR 0x800102xx */
+		cpu_p10: cpu@10200 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10200>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p11: cpu@10201 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10201>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p12: cpu@10202 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10202>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p13: cpu@10203 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10203>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p14: cpu@10204 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10204>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+		cpu_p15: cpu@10205 { compatible = "apple,brava-p"; device_type = "cpu"; reg = <0x0 0x10205>; enable-method = "spin-table"; cpu-release-addr = <0 0>; };
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		/* AIC v3 uses 3-cell interrupt specifiers */
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+
+		/*
+		 * AIC v3. Driver (apple,t8122-aic3) hardcodes the register
+		 * offsets (INFO1=0x4, INFO3=0xc, IRQ_CFG=0x10000) which match
+		 * this hardware (ADT cap0-offset=4, maxnumirq-offset=12,
+		 * extint-baseaddress=0x10000), so no *-offset props are needed.
+		 * event reg = core + 0x40000 (ADT aic-iack-offset).
+		 */
+		aic: interrupt-controller@502400000 {
+			compatible = "apple,t6041-aic3", "apple,t8122-aic3";
+			#interrupt-cells = <3>;
+			interrupt-controller;
+			/*
+			 * CPU-physical address: the ADT aic reg (bus 0x302400000)
+			 * is in /arm-io space, whose ranges map bus->parent with
+			 * +0x200000000 (bus 0x0..0x480000000 -> 0x200000000), so
+			 * the real address is 0x502400000. (Matches pmgr/cpustart
+			 * at 0x5028xxxxx.) Using the raw bus 0x302400000 hits a
+			 * hole and L2C ACCESS_FAULTs.
+			 */
+			reg = <0x5 0x02400000 0x0 0x1cc000>,
+			      <0x5 0x02440000 0x0 0x4>;
+			reg-names = "core", "event";
+		};
+
+		/*
+		 * Power manager. Controller nodes here; the per-device
+		 * power-state controllers are in t6041-pmgr.dtsi (generated
+		 * from the ADT). Addresses/sizes from the ADT.
+		 */
+		pmgr0: power-management@288e80000 {
+			compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x2 0x88e80000 0x0 0x4000>;
+		};
+
+		pmgr1: power-management@502280000 {
+			compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x5 0x02280000 0x0 0x14000>;
+		};
+
+		pmgr2: power-management@502800000 {
+			compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x5 0x02800000 0x0 0xc000>;
+		};
+
+		pmgr3: power-management@508300000 {
+			compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x5 0x08300000 0x0 0x4000>;
+		};
+
+		serial0: serial@429200000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x4 0x29200000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1559 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart0>;
+			status = "okay";
+		};
+	};
+};
+
+#include "t6041-pmgr.dtsi"
