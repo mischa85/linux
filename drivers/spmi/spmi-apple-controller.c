@@ -58,6 +58,20 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 	return 0;
 }
 
+/*
+ * Any stale word left in the RX FIFO by a previous transaction shifts every
+ * following reply and turns all reads into garbage, so drain defensively
+ * before issuing a new command.
+ */
+static void apple_spmi_drain_rx(struct spmi_controller *ctrl)
+{
+	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
+
+	while (!(readl(spmi->regs + SPMI_STATUS_REG) & SPMI_RX_FIFO_EMPTY))
+		dev_warn(&ctrl->dev, "leftover RX data: 0x%x\n",
+			 readl(spmi->regs + SPMI_RSP_REG));
+}
+
 static int spmi_read_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 			 u16 saddr, u8 *buf, size_t len)
 {
@@ -67,6 +81,16 @@ static int spmi_read_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	size_t len_read = 0;
 	u8 i;
 	int ret;
+
+	/*
+	 * Basic register reads carry the 5-bit register address in the low
+	 * bits of the opcode (hardware-verified against the T6041 ACE3;
+	 * matches m1n1). The extra field carries it too.
+	 */
+	if (opc == SPMI_CMD_READ)
+		spmi_cmd |= saddr & 0x1f;
+
+	apple_spmi_drain_rx(ctrl);
 
 	writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
 
@@ -98,6 +122,34 @@ static int spmi_write_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	size_t i = 0, j;
 	int ret;
 
+	apple_spmi_drain_rx(ctrl);
+
+	/*
+	 * Basic register writes are a single command word: the 5-bit register
+	 * address lives in the low bits of the opcode and the data byte in
+	 * the upper byte of the extra field. Pushing the data byte as an
+	 * additional FIFO word (as for extended writes) makes the controller
+	 * emit spurious replies which permanently desynchronize the RX FIFO
+	 * (hardware-verified against the T6041 ACE3; encoding matches m1n1).
+	 */
+	if (opc == SPMI_CMD_WRITE) {
+		if (len != 1)
+			return -EINVAL;
+
+		spmi_cmd = apple_spmi_pack_cmd(opc | (saddr & 0x1f), sid,
+					       saddr | (buf[0] << 8), 1);
+		writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
+
+		ret = apple_spmi_wait_rx_not_empty(ctrl);
+		if (ret)
+			return ret;
+
+		/* Discard */
+		readl(spmi->regs + SPMI_RSP_REG);
+
+		return 0;
+	}
+
 	writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
 
 	while (i < len) {
@@ -108,6 +160,26 @@ static int spmi_write_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 
 		writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
 	}
+
+	ret = apple_spmi_wait_rx_not_empty(ctrl);
+	if (ret)
+		return ret;
+
+	/* Discard */
+	readl(spmi->regs + SPMI_RSP_REG);
+
+	return 0;
+}
+
+static int spmi_nodata_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid)
+{
+	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
+	u32 spmi_cmd = apple_spmi_pack_cmd(opc, sid, 0, 1);
+	int ret;
+
+	apple_spmi_drain_rx(ctrl);
+
+	writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
 
 	ret = apple_spmi_wait_rx_not_empty(ctrl);
 	if (ret)
@@ -139,6 +211,7 @@ static int apple_spmi_probe(struct platform_device *pdev)
 
 	ctrl->read_cmd = spmi_read_cmd;
 	ctrl->write_cmd = spmi_write_cmd;
+	ctrl->cmd = spmi_nodata_cmd;
 
 	ret = devm_spmi_controller_add(&pdev->dev, ctrl);
 	if (ret)
