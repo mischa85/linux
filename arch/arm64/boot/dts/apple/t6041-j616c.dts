@@ -22,8 +22,10 @@
 
 /dts-v1/;
 
+#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/apple.h>
 
 / {
 	compatible = "apple,j616c", "apple,t6041", "apple,arm-platform";
@@ -345,6 +347,255 @@
 			power-domains = <&ps_ans>, <&ps_apcie_st0>;
 			power-domain-names = "ans", "apcie0";
 			resets = <&ps_ans>;
+		};
+
+		/* ================================================================
+		 * PCIe bring-up (apcie0) — internal root complex, T6041 / M4 Max.
+		 *
+		 * m1n1 (HV) already brings the root complex + PHY up on hardware
+		 * (verified: ECAM enumerates the Apple root port). Linux's job here
+		 * is: bind pcie-apple.c, drive PERST# per port (reset-gpios -> gpio0),
+		 * train the links, and enumerate the internal endpoints
+		 * (WLAN/BT on port0, SD-card reader on port1).
+		 *
+		 * All CPU-phys addresses = ADT bus addr + 0x200000000 (arm-io ranges),
+		 * same convention as the AIC/pmgr/NVMe nodes above.
+		 * Source: t6041_proxy_dump/adt.txt node `apcie0` / `dart-apcie0` / `gpio0`.
+		 *
+		 * ---- reg-names mapping (VERIFIED against pcie-apple.c) ----
+		 *   pcie->base = devm_platform_ioremap_resource(pdev, 1)  -> reg[1] = "rc"
+		 *       (CORE_* regs + default PHY window base + 0x84000 + 0x4000*port)
+		 *   ECAM config = reg[0] = "config" (consumed by pci-host-ecam layer)
+		 *   port N base = platform_get_resource_byname("portN")
+		 *   port N phy  = platform_get_resource_byname("phyN")  -> t602x needs
+		 *       an explicit per-port PHY-glue window (setup_refclk() pokes
+		 *       PHY_LANE_CFG at port->phy). Confirmed by the M3 (t6031) template
+		 *       whose phy0 = 0x...9e020000 is the per-port phy-glue region; the
+		 *       ADT reg matching that on T6041 is 0x2170{20,24,28,2c}000.
+		 *   ADT reg index map used below (0-based, per adt.txt apcie0.reg[]):
+		 *       reg[0]=0x1cb0000000 config   reg[1]=0x214000000 rc
+		 *       reg[7]=0x210028000 port0     reg[9]=0x217020000 phy0
+		 *       reg[14]=0x211028000 port1    reg[16]=0x217024000 phy1
+		 *       reg[21]=0x212028000 port2    reg[23]=0x217028000 phy2
+		 *       reg[28]=0x213028000 port3    reg[30]=0x21702c000 phy3
+		 *   (reg[2] coalesced-PHY and reg[4] axi2af are owned by m1n1; omitted.)
+		 *
+		 * AIC interrupts use the T6041 3-cell form <AIC_IRQ N flag> (this die
+		 * has no die-index cell — cf. the M3 t6031 which uses 4 cells).
+		 *
+		 * ASSUMPTIONS / TO VERIFY ON FIRST BOOT (flagged):
+		 *  - port config window size: ADT says 0x8000, M3 template uses 0x4000;
+		 *    driver only touches < 0x3800, so 0x4000 is safe. Using 0x4000.
+		 *  - PERST GPIOs: ADT apcie0 `function-perst` = GPIO(4)/GPIO(5),
+		 *    active-low -> port0=gpio0 pin4, port1=gpio0 pin5.
+		 *  - power-domain: ps_apcie_gp (matches t6041-pmgr.dtsi label + t8103).
+		 *  - single DART (dart-apcie0) with per-function SIDs 0x10/0x11/0x12,
+		 *    unlike M3's per-port DARTs. iommu-map routes each port's RID to a
+		 *    distinct SID on the same DART. See DART note below.
+		 * ================================================================ */
+
+		/*
+		 * AP GPIO / pin controller (gpio0). Needed so reset-gpios resolves.
+		 * ADT gpio0: compatible gpio,t8101, reg 0x31C000000 (-> 0x51C000000),
+		 * 200 pins, 7 int-groups (AIC IRQs 478..484). Driver binds
+		 * "apple,t8103-pinctrl". power-domains omitted: t6041-pmgr.dtsi has no
+		 * ps_gpio yet and m1n1/iBoot leaves the GPIO block powered.
+		 */
+		pinctrl_ap: pinctrl@51c000000 {
+			compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x5 0x1c000000 0x0 0x4000>;
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 479 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 480 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 482 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 483 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 484 IRQ_TYPE_LEVEL_HIGH>;
+
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_ap 0 0 200>;
+			apple,npins = <200>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			/*
+			 * PCIe CLKREQ# pins. From the ADT bridge functions:
+			 * apcie0/pci-bridge0 function-clkreq = GPIO(pin 0, func 2),
+			 * pci-bridge1 function-clkreq = GPIO(pin 1, func 2).
+			 * These must be muxed to their peripheral function (2) or
+			 * the device never gets its reference clock and the link
+			 * won't train (PERST alone is not enough). Mirrors the
+			 * pcie_pins group on M1/M2 (t8103.dtsi).
+			 */
+			pcie_pins: pcie-pins {
+				pinmux = <APPLE_PINMUX(0, 2)>,
+					 <APPLE_PINMUX(1, 2)>;
+			};
+		};
+
+		/*
+		 * PCIe DART (IOMMU). ONE DART on M4 (contrast M3 per-port DARTs).
+		 * ADT dart-apcie0: compatible dart,t8110, reg 0x210000000
+		 * (-> 0x410000000) size 0x20000, IRQ 1724, dart-id 1, sid-count 19.
+		 * SIDs from ADT `sid`: 0x10 wlan, 0x11 bt, 0x12 piodma.
+		 * #iommu-cells=1 (verified apple-dart of_xlate: single SID arg).
+		 */
+		pcie0_dart: iommu@410000000 {
+			compatible = "apple,t6041-dart", "apple,t8110-dart";
+			reg = <0x4 0x10000000 0x0 0x20000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1724 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_apcie_gp>;
+		};
+
+		apcie0: pcie@1cb0000000 {
+			compatible = "apple,t6041-pcie", "apple,t6040-pcie";
+			device_type = "pci";
+
+			reg = <0x1c 0xb0000000 0x0 0x10000000>,	/* config / ECAM */
+			      <0x4 0x14000000 0x0 0x4000>,	/* rc (pcie->base) */
+			      <0x4 0x10028000 0x0 0x4000>,	/* port0 */
+			      <0x4 0x11028000 0x0 0x4000>,	/* port1 */
+			      <0x4 0x12028000 0x0 0x4000>,	/* port2 */
+			      <0x4 0x13028000 0x0 0x4000>,	/* port3 */
+			      <0x4 0x17020000 0x0 0x4000>,	/* phy0 */
+			      <0x4 0x17024000 0x0 0x4000>,	/* phy1 */
+			      <0x4 0x17028000 0x0 0x4000>,	/* phy2 */
+			      <0x4 0x1702c000 0x0 0x4000>;	/* phy3 */
+			reg-names = "config", "rc",
+				    "port0", "port1", "port2", "port3",
+				    "phy0", "phy1", "phy2", "phy3";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1723 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1732 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1741 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1750 IRQ_TYPE_LEVEL_HIGH>;
+
+			msi-controller;
+			msi-parent = <&apcie0>;
+			/* msi-vector-offset=2071, #msi-vectors=32 (ADT). */
+			msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
+
+			/*
+			 * Single DART: route each root-port RID range to a distinct
+			 * SID. RID base = (bus << 8); iommu-map-mask 0xff00 selects the
+			 * bus. port0(bus1)->SID 0x10 (wlan), port1(bus2)->SID 0x11 (bt/SD).
+			 * NOTE: WLAN+BT are two functions behind port0 and the ADT lists
+			 * separate wlan/bt SIDs; a single SID per port may be too coarse
+			 * for BT if it presents as a distinct RID. VERIFY on first boot —
+			 * may need per-function iommu-map entries or a wider length.
+			 */
+			iommu-map = <0x100 &pcie0_dart 0x10 1>,
+				    <0x200 &pcie0_dart 0x11 1>,
+				    <0x300 &pcie0_dart 0x12 1>,
+				    <0x400 &pcie0_dart 0x13 1>;
+			iommu-map-mask = <0xff00>;
+
+			bus-range = <0 4>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			/*
+			 * ranges (from ADT): mem64 prefetch @ 0xBC0000000 size 0x20000000,
+			 * mem32 @ 0xB80000000 size 0x40000000.
+			 */
+			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0xb8000000 0xb 0x80000000 0x0 0x40000000>;
+
+			power-domains = <&ps_apcie_gp>;
+			pinctrl-0 = <&pcie_pins>;
+			pinctrl-names = "default";
+
+			dma-coherent;
+
+			status = "okay";
+
+			/* port0: WLAN/BT. PERST# = gpio0 pin 4 (active-low). */
+			port00: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				reset-gpios = <&pinctrl_ap 4 GPIO_ACTIVE_LOW>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+						<0 0 0 2 &port00 0 0 0 1>,
+						<0 0 0 3 &port00 0 0 0 2>,
+						<0 0 0 4 &port00 0 0 0 3>;
+				status = "okay";
+			};
+
+			/* port1: SD-card reader. PERST# = gpio0 pin 5 (active-low). */
+			port01: pci@1,0 {
+				device_type = "pci";
+				reg = <0x800 0x0 0x0 0x0 0x0>;
+				reset-gpios = <&pinctrl_ap 5 GPIO_ACTIVE_LOW>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
+						<0 0 0 2 &port01 0 0 0 1>,
+						<0 0 0 3 &port01 0 0 0 2>,
+						<0 0 0 4 &port01 0 0 0 3>;
+				status = "okay";
+			};
+
+			/* port2/port3: unused on this board; left disabled.
+			 * PERST pins unknown (ADT only lists perst for port0/1). */
+			port02: pci@2,0 {
+				device_type = "pci";
+				reg = <0x1000 0x0 0x0 0x0 0x0>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+						<0 0 0 2 &port02 0 0 0 1>,
+						<0 0 0 3 &port02 0 0 0 2>,
+						<0 0 0 4 &port02 0 0 0 3>;
+				status = "disabled";
+			};
+
+			port03: pci@3,0 {
+				device_type = "pci";
+				reg = <0x1800 0x0 0x0 0x0 0x0>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port03 0 0 0 0>,
+						<0 0 0 2 &port03 0 0 0 1>,
+						<0 0 0 3 &port03 0 0 0 2>,
+						<0 0 0 4 &port03 0 0 0 3>;
+				status = "disabled";
+			};
 		};
 	};
 };
