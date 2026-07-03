@@ -749,23 +749,72 @@
 			interrupts = <AIC_IRQ 1655 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
-		/*
-		 * usb-drd2: USB-C port 3 (right). KNOWN-WORKING static host
-		 * stack: plain dwc3 core binds at boot on top of m1n1's
-		 * SSPS + host-mode PHY flip (device present at boot
-		 * enumerates and works; hotplug needs the proper stack).
-		 * The proper dwc3-apple/atcphy stack (see usb-drd1) is NOT
-		 * used here yet: the dwc3 core soft reset times out after
-		 * OUR PHY/reset cycling even though byte-identical sequences
-		 * from m1n1 work — unresolved, see t6041-usb notes.
-		 */
+		/* usb-drd2: USB-C port 3 (right). Same proper stack as usb-drd1. */
 		usb_drd2: usb@392280000 {
-			compatible = "snps,dwc3";
-			reg = <0x3 0x92280000 0x0 0xcd00>;
+			compatible = "apple,t6041-dwc3", "apple,t8103-dwc3";
+			reg = <0x3 0x92280000 0x0 0xcd00>,
+			      <0x3 0x9228cd00 0x0 0x3200>;
+			reg-names = "dwc3-core", "dwc3-apple";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1683 IRQ_TYPE_LEVEL_HIGH>;
-			dr_mode = "host";
+			dr_mode = "otg";
+			usb-role-switch;
+			role-switch-default-mode = "host";
 			iommus = <&usb2_dart0 0>, <&usb2_dart1 1>;
+			resets = <&atcphy2>;
+			phys = <&atcphy2 PHY_TYPE_USB2>, <&atcphy2 PHY_TYPE_USB3>;
+			phy-names = "usb2-phy", "usb3-phy";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					dwc3_2_hs: endpoint {
+						remote-endpoint = <&typec2_connector_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					dwc3_2_ss: endpoint {
+						remote-endpoint = <&atcphy2_usb3>;
+					};
+				};
+			};
+		};
+
+		atcphy2: phy@392a90000 {
+			compatible = "apple,t6041-atcphy";
+			reg = <0x3 0x92a90000 0x0 0x4000>,
+			      <0x3 0x92a84000 0x0 0x4000>;
+			reg-names = "usb2phy", "pipehandler";
+
+			#phy-cells = <1>;
+			#reset-cells = <0>;
+
+			orientation-switch;
+			mode-switch;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					atcphy2_typec_lanes: endpoint {
+						remote-endpoint = <&typec2_connector_ss>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					atcphy2_usb3: endpoint {
+						remote-endpoint = <&dwc3_2_ss>;
+					};
+				};
+			};
 		};
 
 		usb2_dart0: iommu@392f00000 {
@@ -842,11 +891,6 @@
 			#address-cells = <2>;
 			#size-cells = <0>;
 
-			/*
-			 * No connector graph: the right port runs the static
-			 * dwc3 host stack, tipd only manages PD state (S0/
-			 * VBUS) and reports typec status.
-			 */
 			hpm2: usb-pd@c {
 				compatible = "apple,sn201202x";
 				reg = <0xc SPMI_USID>;
@@ -855,6 +899,25 @@
 					compatible = "usb-c-connector";
 					power-role = "dual";
 					data-role = "dual";
+
+					ports {
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						port@0 {
+							reg = <0>;
+							typec2_connector_hs: endpoint {
+								remote-endpoint = <&dwc3_2_hs>;
+							};
+						};
+
+						port@1 {
+							reg = <1>;
+							typec2_connector_ss: endpoint {
+								remote-endpoint = <&atcphy2_typec_lanes>;
+							};
+						};
+					};
 				};
 			};
 		};
