@@ -81,15 +81,6 @@
 #define USB2PHY_MISCTUNE_APBCLK_GATE_OFF BIT(29)
 #define USB2PHY_MISCTUNE_REFCLK_GATE_OFF BIT(30)
 
-/*
- * DIAGNOSTIC: when true, the reset ops and the usb2 power cycling become
- * no-ops, leaving the PHY/pipehandler exactly in the state m1n1 left them
- * (the state the dwc3 core demonstrably soft-resets from when bound
- * directly). Used to bisect the dwc3 CSFTRST timeout; remove when solved.
- */
-static bool atcphy_t6041_minimal_ops;
-module_param_named(minimal_ops, atcphy_t6041_minimal_ops, bool, 0644);
-
 struct atcphy_t6041 {
 	struct device *dev;
 
@@ -129,9 +120,6 @@ static inline void clear32(void __iomem *reg, u32 clear)
 
 static void atcphy_t6041_usb2_power_off(struct atcphy_t6041 *atcphy)
 {
-	if (atcphy_t6041_minimal_ops)
-		return;
-
 	if (!atcphy->usb2_powered)
 		return;
 
@@ -158,9 +146,6 @@ static void atcphy_t6041_usb2_power_off(struct atcphy_t6041 *atcphy)
 
 static void atcphy_t6041_usb2_power_on(struct atcphy_t6041 *atcphy)
 {
-	if (atcphy_t6041_minimal_ops)
-		return;
-
 	if (atcphy->usb2_powered)
 		return;
 
@@ -209,9 +194,6 @@ static int atcphy_t6041_configure_pipehandler_dummy(struct atcphy_t6041 *atcphy)
 	 * 0x9332 = NATIVE_POWER_DOWN=2 | 0x30 | 0x300 | NATIVE_RESET |
 	 * DUMMY_PHY_EN.
 	 */
-	if (atcphy_t6041_minimal_ops)
-		return 0;
-
 	writel(FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_DUMMY) |
 		       FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA, PIPEHANDLER_MUX_CTRL_DATA_DUMMY),
 	       atcphy->pipehandler + PIPEHANDLER_MUX_CTRL);
@@ -225,9 +207,6 @@ static int atcphy_t6041_configure_pipehandler_dummy(struct atcphy_t6041 *atcphy)
 static void atcphy_t6041_dwc3_reset_assert_locked(struct atcphy_t6041 *atcphy)
 {
 	/* Identical to the hardware-proven m1n1 usb_phy_bringup_host() cycle */
-	if (atcphy_t6041_minimal_ops)
-		return;
-
 	clear32(atcphy->pipehandler + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
 	set32(atcphy->pipehandler + PIPEHANDLER_AON_GEN,
 	      PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
@@ -262,8 +241,17 @@ static int atcphy_t6041_dwc3_reset_deassert(struct reset_controller_dev *rcdev,
 
 	guard(mutex)(&atcphy->lock);
 
-	if (atcphy_t6041_minimal_ops)
-		return 0;
+	/*
+	 * The USB2 PHY MUST be running (UTMI clock) before the dwc3 core is
+	 * initialized or its soft reset hangs. This cannot be left to the
+	 * usb2 phy set_mode hook: on the FIRST bring-up dwc3-apple calls
+	 * phy_set_mode before dwc3_core_probe populated the phy handles, so
+	 * it operates on NULL and never reaches us (hardware-traced). The
+	 * reset deassert is the one hook guaranteed to run right before the
+	 * core comes up, so power the PHY on here. The mode (SIG host bits)
+	 * survives the power cycle.
+	 */
+	atcphy_t6041_usb2_power_on(atcphy);
 
 	/*
 	 * Mirror m1n1's hardware-proven release sequence: refresh the dummy
