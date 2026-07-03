@@ -199,6 +199,109 @@
 			power-domains = <&ps_uart0>;
 			status = "okay";
 		};
+
+		/*
+		 * DockChannel UART = the real M4 firmware/debug console (iBoot/
+		 * XNU/m1n1 use it, not the s5l UART), routed out the USB-C SBU
+		 * pins via VDM debug mode (read on the host with vdmtool/macvdmtool
+		 * + FUSB302, picocom 115200). Pair with CONFIG_SERIAL_APPLE_DOCKCHANNEL.
+		 * Data FIFO regs live at base + 0x4000, so reg-offset points the
+		 * earlycon there. Base 0x508828000 = ADT /arm-io/dockchannel-uart.
+		 * Use via bootarg: earlycon=dockchannel,mmio32,0x50882c000
+		 */
+		dockchannel_uart: serial@508828000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <0x5 0x08828000 0x0 0x8000>;
+			reg-offset = <0x4000>;
+			status = "okay";
+		};
+
+		/*
+		 * MTP (Multi-Touch Processor) coprocessor = the M4 internal
+		 * keyboard path. OLD out-of-tree structure (apple,rtk-helper-asc4
+		 * + apple,dockchannel-hid) to match THIS kernel's drivers, with the
+		 * CORRECTED ASC base: the real MTP ASC is 0x514600000 (CPU_CONTROL
+		 * +0x44, mailbox at +0x8000 = 0x514608000), verified live via the
+		 * m1n1 proxy (StandardASC boots it; HELLO v12). Our earlier
+		 * 0x514050000 was a dead all-zeros region -> the Linux -ETIME.
+		 * sram reg omitted (optional; MTP uses DART-backed buffers).
+		 */
+		mtp_dart: iommu@514800000 {
+			compatible = "apple,t8110-dart";
+			reg = <0x5 0x14800000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 775 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x1 0x0>;
+		};
+
+		mtp: mtp@514600000 {
+			compatible = "apple,t6041-mtp", "apple,mtp", "apple,rtk-helper-asc4";
+			reg = <0x5 0x14600000 0x0 0x4000>;
+			reg-names = "asc";
+			mboxes = <&mtp_mbox>;
+			iommus = <&mtp_dart 1>;
+			#helper-cells = <0>;
+			status = "okay";
+		};
+
+		mtp_mbox: mbox@514608000 {
+			compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x5 0x14608000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 792 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 793 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 794 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 795 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		mtp_dockchannel: fifo@514b14000 {
+			compatible = "apple,t6041-dockchannel", "apple,dockchannel";
+			reg = <0x5 0x14b14000 0x0 0x4000>;
+			reg-names = "irq";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 776 IRQ_TYPE_LEVEL_HIGH>;
+			ranges = <0 0x5 0x14b28000 0x20000>;
+			nonposted-mmio;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+
+			mtp_hid: input@8000 {
+				compatible = "apple,dockchannel-hid";
+				reg = <0x8000 0x4000>,
+				      <0xc000 0x4000>,
+				      <0x0000 0x4000>,
+				      <0x4000 0x4000>;
+				reg-names = "config", "data",
+					    "rmt-config", "rmt-data";
+				iommus = <&mtp_dart 1>;
+				interrupt-parent = <&mtp_dockchannel>;
+				interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+					     <3 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names = "tx", "rx";
+				apple,fifo-size = <0x800>;
+				apple,helper-cpu = <&mtp>;
+				status = "okay";
+
+				/* HID subdevice child nodes: the dockchannel-hid driver
+				 * does of_get_child_by_name() per subdevice and ignores
+				 * any without a node. The keyboard is what we want. */
+				keyboard: keyboard {
+					hid-country-code = <0>;
+					apple,keyboard-layout-id = <0>;
+				};
+
+				/* STM must come up first: it fetches the device IDs that
+				 * gate (id_ready) creation of the deferred keyboard iface. */
+				stm {
+				};
+			};
+		};
 	};
 };
 
