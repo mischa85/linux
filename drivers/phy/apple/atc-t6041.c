@@ -23,6 +23,7 @@
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 #include <dt-bindings/phy/phy.h>
 #include <linux/reset-controller.h>
 #include <linux/usb/typec_mux.h>
@@ -43,7 +44,9 @@
 #define PIPEHANDLER_MUX_CTRL_CLK GENMASK(5, 3)
 #define PIPEHANDLER_MUX_CTRL_DATA GENMASK(2, 0)
 #define PIPEHANDLER_MUX_CTRL_CLK_OFF 0
+#define PIPEHANDLER_MUX_CTRL_CLK_USB3 1
 #define PIPEHANDLER_MUX_CTRL_CLK_DUMMY 4
+#define PIPEHANDLER_MUX_CTRL_DATA_USB3 0
 #define PIPEHANDLER_MUX_CTRL_DATA_DUMMY 2
 
 #define PIPEHANDLER_LOCK_REQ 0x10
@@ -90,6 +93,9 @@ struct atcphy_t6041 {
 	struct mutex lock;
 	bool usb2_powered;
 	bool pipehandler_up;
+	bool usb3_armed;
+	bool usb3_flip_pending;
+	struct delayed_work usb3_flip_work;
 
 	struct phy *phy_usb2;
 	struct phy *phy_usb3;
@@ -202,6 +208,67 @@ static int atcphy_t6041_configure_pipehandler_dummy(struct atcphy_t6041 *atcphy)
 	return 0;
 }
 
+static int atcphy_t6041_configure_pipehandler_usb3(struct atcphy_t6041 *atcphy)
+{
+	u32 reg;
+	int ret;
+
+	/*
+	 * Switch the PIPE mux from the dummy PHY to the real USB3 PHY.
+	 * Hardware-proven sequence (2026-07-03 bring-up): atc.c host order
+	 * minus the BIST dance — the MAC-side status/override machinery is
+	 * pclk-domain and only comes alive after this switch; the lane
+	 * reports ready (MAC_STATUS2 bit8 low) on the mux flip alone.
+	 * MUST run after the dwc3 core soft reset (which needs the dummy
+	 * pclk) — i.e. from the usb3 phy power_on hook.
+	 */
+
+	/* force-disable link detection while switching */
+	clear32(atcphy->pipehandler + PIPEHANDLER_OVERRIDE_VALUES,
+		PIPEHANDLER_OVERRIDE_VAL_RXDETECT0 | PIPEHANDLER_OVERRIDE_VAL_RXDETECT1);
+	set32(atcphy->pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
+	set32(atcphy->pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
+
+	set32(atcphy->pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
+	ret = readl_poll_timeout(atcphy->pipehandler + PIPEHANDLER_LOCK_ACK, reg,
+				 reg & PIPEHANDLER_LOCK_EN, 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
+	if (ret)
+		dev_warn(atcphy->dev, "pipehandler lock not acked\n");
+
+	/* release the (now non-selected) dummy PHY reset */
+	mask32(atcphy->pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 3));
+	clear32(atcphy->pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE, PIPEHANDLER_NATIVE_RESET);
+
+	/*
+	 * NOTE: every hardware-validated run of this switch (m1n1 proxy or
+	 * in-guest devmem) had millisecond-scale gaps between these writes
+	 * (transport latency). With atc.c's literal 10us the xhci stops
+	 * processing events after the switch — keep the validated pacing.
+	 */
+	mask32(atcphy->pipehandler + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK,
+	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_OFF));
+	usleep_range(2000, 3000);
+	mask32(atcphy->pipehandler + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DATA,
+	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA, PIPEHANDLER_MUX_CTRL_DATA_USB3));
+	usleep_range(2000, 3000);
+	mask32(atcphy->pipehandler + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK,
+	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_USB3));
+	usleep_range(2000, 3000);
+
+	/* remove the link detection override */
+	clear32(atcphy->pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
+	clear32(atcphy->pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
+
+	clear32(atcphy->pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
+	ret = readl_poll_timeout(atcphy->pipehandler + PIPEHANDLER_LOCK_ACK, reg,
+				 !(reg & PIPEHANDLER_LOCK_EN), 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
+	if (ret)
+		dev_warn(atcphy->dev, "pipehandler unlock not acked\n");
+
+	return 0;
+}
+
 /* dwc3 reset controller, consumed by dwc3-apple */
 
 static void atcphy_t6041_dwc3_reset_assert_locked(struct atcphy_t6041 *atcphy)
@@ -218,6 +285,8 @@ static int atcphy_t6041_dwc3_reset_assert(struct reset_controller_dev *rcdev, un
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
+
+	atcphy->usb3_flip_pending = false;
 
 	atcphy_t6041_dwc3_reset_assert_locked(atcphy);
 
@@ -350,12 +419,71 @@ static int atcphy_t6041_usb3_set_mode(struct phy *phy, enum phy_mode mode, int s
 	}
 }
 
+static int atcphy_t6041_usb3_power_on(struct phy *phy)
+{
+	struct atcphy_t6041 *atcphy = phy_get_drvdata(phy);
+
+	guard(mutex)(&atcphy->lock);
+
+	/*
+	 * dwc3 core calls this right after its soft reset (which ran on the
+	 * dummy pclk) — the validated point to hand the PIPE to the real
+	 * USB3 PHY. Gated on the bring-up arm flag: the SuperSpeed PHY core
+	 * (uC firmware + tunables + lane setup) is armed externally by the
+	 * m1n1-side prep for now; flipping an unarmed PHY starves the MAC
+	 * of pclk.
+	 */
+	if (!atcphy->usb3_armed)
+		return 0;
+
+	/*
+	 * Too early to flip here: xhci's own setup still needs the dummy
+	 * pclk (flipping now makes its probe time out, hardware-verified).
+	 * The validated ordering is "flip with xhci fully up", so defer.
+	 *
+	 * KNOWN BUG (boot44): on cable re-attach dwc3-apple cycles our reset
+	 * again after this hook, which clears usb3_flip_pending — the flip
+	 * then never fires for hotplugged cables (first boot-time attach is
+	 * fine). Needs a smarter trigger (e.g. re-schedule from the last
+	 * reset deassert, or hook the role-switch settle).
+	 */
+	atcphy->usb3_flip_pending = true;
+	schedule_delayed_work(&atcphy->usb3_flip_work, msecs_to_jiffies(10000));
+	dev_info(atcphy->dev, "USB3 PIPE flip scheduled\n");
+
+	return 0;
+}
+
+static void atcphy_t6041_usb3_flip_work(struct work_struct *work)
+{
+	struct atcphy_t6041 *atcphy =
+		container_of(work, struct atcphy_t6041, usb3_flip_work.work);
+	int ret;
+
+	guard(mutex)(&atcphy->lock);
+
+	if (!atcphy->usb3_flip_pending)
+		return;
+	atcphy->usb3_flip_pending = false;
+
+	ret = atcphy_t6041_configure_pipehandler_usb3(atcphy);
+	if (ret) {
+		dev_warn(atcphy->dev, "Failed to switch pipe to USB3: %d\n", ret);
+		return;
+	}
+
+	atcphy->pipehandler_up = true;
+	dev_info(atcphy->dev, "PIPE handler switched to USB3\n");
+}
+
 static int atcphy_t6041_usb3_power_off(struct phy *phy)
 {
 	struct atcphy_t6041 *atcphy = phy_get_drvdata(phy);
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
+
+	atcphy->usb3_flip_pending = false;
 
 	ret = atcphy_t6041_configure_pipehandler_dummy(atcphy);
 	if (ret)
@@ -370,6 +498,7 @@ static int atcphy_t6041_usb3_power_off(struct phy *phy)
 static const struct phy_ops atcphy_t6041_usb3_phy_ops = {
 	.owner = THIS_MODULE,
 	.set_mode = atcphy_t6041_usb3_set_mode,
+	.power_on = atcphy_t6041_usb3_power_on,
 	.power_off = atcphy_t6041_usb3_power_off,
 };
 
@@ -391,6 +520,19 @@ static int atcphy_t6041_mux_set(struct typec_mux_dev *mux, struct typec_mux_stat
 
 	if (state->mode == TYPEC_STATE_SAFE) {
 		on = false;
+		/*
+		 * First signal of a cable detach — runs before the dwc3/xhci
+		 * teardown. Hand the PIPE back to the dummy PHY NOW so the
+		 * teardown never touches xhci registers without a stable pclk
+		 * (flipping later, from the reset assert, wedges the machine:
+		 * hardware-verified).
+		 */
+		atcphy->usb3_flip_pending = false;
+		if (atcphy->pipehandler_up) {
+			atcphy_t6041_configure_pipehandler_dummy(atcphy);
+			atcphy->pipehandler_up = false;
+			dev_info(atcphy->dev, "PIPE handler back to dummy (detach)\n");
+		}
 	} else if (state->alt) {
 		dev_warn(atcphy->dev,
 			 "Alternate mode SVID 0x%x not supported (USB2-only PHY); staying USB2\n",
@@ -469,6 +611,16 @@ static int atcphy_t6041_probe(struct platform_device *pdev)
 	 * off) and the first cable event brings everything up cleanly.
 	 */
 	atcphy->usb2_powered = true;
+
+	/*
+	 * USB3 bring-up: flip the PIPE to the real USB3 PHY once dwc3 is up
+	 * IF the SS PHY core was armed pre-boot (m1n1/proxy prep). Explicit
+	 * per-port opt-in via DT until the driver grows the full PHY init.
+	 */
+	INIT_DELAYED_WORK(&atcphy->usb3_flip_work, atcphy_t6041_usb3_flip_work);
+	atcphy->usb3_armed = of_property_read_bool(dev->of_node, "apple,usb3-test-armed");
+	if (atcphy->usb3_armed)
+		dev_info(dev, "USB3 test arm flag set: will mux PIPE to USB3\n");
 
 	atcphy->rcdev.owner = THIS_MODULE;
 	atcphy->rcdev.nr_resets = 1;

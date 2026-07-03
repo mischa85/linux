@@ -790,6 +790,8 @@
 			reg = <0x3 0x92a90000 0x0 0x4000>,
 			      <0x3 0x92a84000 0x0 0x4000>;
 			reg-names = "usb2phy", "pipehandler";
+			/* USB3 bring-up: SS PHY core armed pre-boot by the proxy prep */
+			apple,usb3-test-armed;
 
 			#phy-cells = <1>;
 			#reset-cells = <0>;
